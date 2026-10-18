@@ -4,6 +4,8 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Telegram PresentationGen AI Bot</title>
+    <!-- Telegram Web App SDK: даёт initData для проверки пользователя на сервере -->
+    <script src="https://telegram.org/js/telegram-web-app.js"></script>
     <!-- Tailwind CSS -->
     <script src="https://cdn.tailwindcss.com"></script>
     <script>
@@ -461,13 +463,31 @@ if __name__ == "__main__":
         let currentSlideIndex = 0;
         let isGenerating = false;
 
-        // Gemini API Configuration (Default empty API key relies on Canvas runtime injection)
-        const API_KEY = "";
-        const GEMINI_TEXT_URL = `https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent?key=${API_KEY}`;
-        const GEMINI_IMAGE_URL = `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite-image:generateContent?key=${API_KEY}`;
+        // Backend API: ключ Gemini хранится на сервере бота, адрес приходит из кнопки бота (?api=...)
+        const API_BASE = (new URLSearchParams(window.location.search).get('api') || '').replace(/\/+$/, '');
+        const tg = window.Telegram?.WebApp;
+
+        async function callBackend(path, body) {
+            if (!API_BASE) throw new Error("Не задан адрес сервера. Откройте приложение через кнопку в боте.");
+            if (!tg?.initData) throw new Error("Откройте приложение внутри Telegram через кнопку в боте.");
+
+            const response = await fetchWithRetry(`${API_BASE}${path}`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ ...body, initData: tg.initData })
+            });
+
+            let data = null;
+            try { data = await response.json(); } catch (e) { /* ответ не JSON */ }
+            if (!response.ok) throw new Error(data?.error || `Сервер ответил с ошибкой ${response.status}`);
+            return data;
+        }
 
         // Initialize UI
         window.onload = function() {
+            tg?.ready();
+            tg?.expand();
+
             // Register Keyboard Navigation for Presentation Viewer
             document.addEventListener('keydown', (e) => {
                 if (!currentPresentation) return;
@@ -601,73 +621,28 @@ if __name__ == "__main__":
             appendChatMessage('bot', `<p class="flex items-center gap-2 text-cyan-400 font-medium"><i class="fa-solid fa-spinner animate-spin"></i> Создаю презентацию: "${topic}"...</p>`);
 
             try {
-                // 1. Generate Structured Text JSON with Gemini Flash
-                const systemPrompt = `You are an expert presentation designer. Create a high-quality presentation structure on the topic: "${topic}".
-Language of presentation: ${lang}.
-Number of slides: ${slideCount}.
-For each slide provide:
-- "title": Concise slide title
-- "subtitle": Subtitle or key takeaway summary
-- "bullets": Array of 3 key concise bullet points
-- "layout": One of ["title-slide", "bullets-right", "card-grid"]
-- "imagePrompt": Detailed English prompt describing a futuristic, modern visual representation for this slide.`;
-
-                const payload = {
-                    contents: [{ parts: [{ text: systemPrompt }] }],
-                    generationConfig: {
-                        responseMimeType: "application/json",
-                        responseSchema: {
-                            type: "OBJECT",
-                            properties: {
-                                "presentationTitle": { "type": "STRING" },
-                                "slides": {
-                                    "type": "ARRAY",
-                                    "items": {
-                                        "type": "OBJECT",
-                                        "properties": {
-                                            "slideNumber": { "type": "INTEGER" },
-                                            "title": { "type": "STRING" },
-                                            "subtitle": { "type": "STRING" },
-                                            "bullets": {
-                                                "type": "ARRAY",
-                                                "items": { "type": "STRING" }
-                                            },
-                                            "layout": { "type": "STRING" },
-                                            "imagePrompt": { "type": "STRING" }
-                                        },
-                                        "required": ["slideNumber", "title", "subtitle", "bullets", "layout", "imagePrompt"]
-                                    }
-                                }
-                            },
-                            "required": ["presentationTitle", "slides"]
-                        }
-                    }
-                };
-
-                const response = await fetchWithRetry(GEMINI_TEXT_URL, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(payload)
-                });
-
-                const data = await response.json();
-                const jsonText = data.candidates?.[0]?.content?.parts?.[0]?.text;
-                if (!jsonText) throw new Error("Не удалось получить структурированный ответ от Gemini.");
-
-                const presentationData = JSON.parse(jsonText);
+                // 1. Generate Structured Text JSON on the bot server (Gemini Flash)
+                const presentationData = await callBackend('/api/generate', { topic, slideCount, lang });
+                if (!presentationData?.slides?.length) throw new Error("Сервер вернул пустую презентацию.");
                 presentationData.styleClass = styleClass;
 
                 // 2. Optional: Generate AI Images per slide if enabled
                 if (generateImages) {
                     document.getElementById('loadingStatusText').innerText = "Генерация AI-иллюстраций для слайдов...";
+                    let imageError = null;
                     for (let slide of presentationData.slides) {
+                        slide.imageUrl = null;
+                        // После первой ошибки (например, нет квоты) остальные слайды не мучаем
+                        if (imageError) continue;
                         try {
-                            const imgUrl = await generateSlideImage(slide.imagePrompt);
-                            slide.imageUrl = imgUrl;
+                            slide.imageUrl = await generateSlideImage(slide.imagePrompt);
                         } catch (imgErr) {
                             console.warn("Ошибка генерации картинки для слайда", slide.slideNumber, imgErr);
-                            slide.imageUrl = null;
+                            imageError = imgErr;
                         }
+                    }
+                    if (imageError) {
+                        appendChatMessage('bot', `<p class="text-amber-400 text-xs"><i class="fa-solid fa-image mr-1"></i> Картинки не созданы: ${imageError.message}</p>`);
                     }
                 }
 
@@ -706,38 +681,22 @@ For each slide provide:
 
         // Helper: Image Generation via Gemini 3.1 Flash Lite Image
         async function generateSlideImage(promptText) {
-            const payload = {
-                contents: [{
-                    parts: [{ text: `A clean, modern, professional graphic illustration for a presentation slide showing: ${promptText}. Minimalist vector art style, high visual appeal.` }]
-                }],
-                generationConfig: {
-                    responseModalities: ['TEXT', 'IMAGE']
-                }
-            };
-
-            const response = await fetchWithRetry(GEMINI_IMAGE_URL, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(payload)
-            });
-
-            const result = await response.json();
-            const base64Data = result?.candidates?.[0]?.content?.parts?.find(p => p.inlineData)?.inlineData?.data;
-            return base64Data ? `data:image/png;base64,${base64Data}` : null;
+            const result = await callBackend('/api/image', { prompt: promptText });
+            return result?.image || null;
         }
 
-        // Helper: Fetch with exponential backoff
-        async function fetchWithRetry(url, options, retries = 3, delay = 1000) {
-            for (let i = 0; i < retries; i++) {
+        // Helper: Fetch with exponential backoff (повторяем только сетевые сбои, 429 и 5xx)
+        async function fetchWithRetry(url, options, retries = 2, delay = 1000) {
+            for (let i = 0; ; i++) {
                 try {
                     const res = await fetch(url, options);
-                    if (res.ok) return res;
+                    const retryable = res.status === 429 || res.status >= 500;
+                    if (res.ok || !retryable || i >= retries) return res;
                 } catch (e) {
-                    if (i === retries - 1) throw e;
+                    if (i >= retries) throw new Error("Сервер недоступен. Проверьте, что бот запущен.");
                 }
                 await new Promise(r => setTimeout(r, delay * Math.pow(2, i)));
             }
-            return await fetch(url, options);
         }
 
         // Render Active Slide in Viewport
