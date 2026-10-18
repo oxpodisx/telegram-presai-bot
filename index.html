@@ -829,16 +829,45 @@ if __name__ == "__main__":
         }
 
         // Export Options
-        function exportJSON() {
-            if (!currentPresentation) return;
-            const dataStr = "data:text/json;charset=utf-8," + encodeURIComponent(JSON.stringify(currentPresentation, null, 2));
+        // Telegram (Desktop и мобильный) не сохраняет загрузки из Web App,
+        // поэтому внутри Telegram файл присылает бот в чат, а в обычном браузере — скачивается.
+        async function deliverFile(format, content, mimeType) {
+            document.getElementById('exportMenu').classList.add('hidden');
+            const title = currentPresentation.presentationTitle || 'presentation';
+
+            if (tg?.initData && API_BASE) {
+                showToast("Отправляю файл в чат с ботом...", "fa-paper-plane");
+                try {
+                    await callBackend('/api/export', { format, content, title });
+                    showToast("Файл отправлен в чат с ботом!", "fa-circle-check");
+                } catch (error) {
+                    console.error(error);
+                    showToast(`Ошибка отправки: ${error.message}`, "fa-circle-xmark");
+                }
+                return;
+            }
+
+            const blob = new Blob([content], { type: `${mimeType};charset=utf-8` });
+            const url = URL.createObjectURL(blob);
             const downloadAnchor = document.createElement('a');
-            downloadAnchor.setAttribute("href", dataStr);
-            downloadAnchor.setAttribute("download", `presentation-${Date.now()}.json`);
+            downloadAnchor.href = url;
+            downloadAnchor.download = `presentation-${Date.now()}.${format}`;
             document.body.appendChild(downloadAnchor);
             downloadAnchor.click();
             downloadAnchor.remove();
-            showToast("JSON экспортирован!", "fa-file-code");
+            setTimeout(() => URL.revokeObjectURL(url), 1000);
+            showToast("Файл скачан!", "fa-download");
+        }
+
+        function escapeHtml(text) {
+            return String(text ?? '').replace(/[&<>"']/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch]));
+        }
+
+        function exportJSON() {
+            if (!currentPresentation) return;
+            // Картинки в base64 слишком тяжёлые для JSON-экспорта
+            const data = { ...currentPresentation, slides: currentPresentation.slides.map(({ imageUrl, ...s }) => s) };
+            deliverFile('json', JSON.stringify(data, null, 2), 'application/json');
         }
 
         function copyPresentationText() {
@@ -866,10 +895,10 @@ if __name__ == "__main__":
 
             const slidesHTML = currentPresentation.slides.map(s => `
                 <div class="slide ${currentPresentation.styleClass}">
-                    <h2>${s.title}</h2>
-                    <p class="subtitle">${s.subtitle}</p>
+                    <h2>${escapeHtml(s.title)}</h2>
+                    <p class="subtitle">${escapeHtml(s.subtitle)}</p>
                     <ul>
-                        ${s.bullets.map(b => `<li>${b}</li>`).join('')}
+                        ${s.bullets.map(b => `<li>${escapeHtml(b)}</li>`).join('')}
                     </ul>
                 </div>
             `).join('');
@@ -879,10 +908,11 @@ if __name__ == "__main__":
 <html lang="ru">
 <head>
     <meta charset="UTF-8">
-    <title>${currentPresentation.presentationTitle}</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>${escapeHtml(currentPresentation.presentationTitle)}</title>
     <style>
-        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; margin: 0; background: #0f172a; color: #fff; }
-        .slide { max-w: 800px; margin: 40px auto; p: 40px; border-radius: 20px; box-shadow: 0 10px 30px rgba(0,0,0,0.5); }
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; margin: 0; padding: 0 16px 40px; background: #0f172a; color: #fff; }
+        .slide { max-width: 800px; margin: 40px auto; padding: 40px; border-radius: 20px; box-shadow: 0 10px 30px rgba(0,0,0,0.5); box-sizing: border-box; }
         .theme-minimal { background: #fff; color: #0f172a; }
         .theme-business { background: #1e293b; color: #f8fafc; }
         .theme-neon { background: #090d16; color: #00ffcc; }
@@ -894,21 +924,13 @@ if __name__ == "__main__":
     </style>
 </head>
 <body>
-    <h1 style="text-align:center; padding-top:20px;">${currentPresentation.presentationTitle}</h1>
+    <h1 style="text-align:center; padding-top:20px;">${escapeHtml(currentPresentation.presentationTitle)}</h1>
     ${slidesHTML}
 </body>
 </html>
             `;
 
-            const dataStr = "data:text/html;charset=utf-8," + encodeURIComponent(htmlContent);
-            const downloadAnchor = document.createElement('a');
-            downloadAnchor.setAttribute("href", dataStr);
-            downloadAnchor.setAttribute("download", `presentation-${Date.now()}.html`);
-            document.body.appendChild(downloadAnchor);
-            downloadAnchor.click();
-            downloadAnchor.remove();
-
-            showToast("HTML файл презентации скачан!", "fa-html5");
+            deliverFile('html', htmlContent.trim(), 'text/html');
         }
 
         function copyPythonCode() {
